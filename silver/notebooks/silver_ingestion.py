@@ -18,7 +18,7 @@ STORAGE_ACCOUNT   = "ecommerceadls2026"
 BRONZE_CONTAINER  = "bronze"
 SILVER_CONTAINER  = "silver"
 
-# Credentials from Databricks Secret Scope
+# Credentials from Databricks Secret Scopes
 # Never stored in code or GitHub
 CLIENT_ID     = dbutils.secrets.get(
     scope="ecommerce-scope",
