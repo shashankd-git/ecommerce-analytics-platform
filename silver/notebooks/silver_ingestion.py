@@ -646,7 +646,27 @@ def run_silver_pipeline(spark):
 
     print(f"✅ All Bronze tables loaded\n")
 
-    # Apply transformations
+    # ── Clean up tables with known ────────────
+    # duplicate key issues before MERGE
+    # Safe to delete — Bronze has raw data
+    # Pipeline will recreate fresh
+    tables_to_clean = [
+            "silver_order_items",
+            "silver_payments"
+    ]
+    for table in tables_to_clean:
+        path = SILVER_DELTA_PATH + table
+        try:
+            if DeltaTable.isDeltaTable(
+                spark, path
+            ):
+                dbutils.fs.rm(path, recurse = True)
+                print(f"✅ Cleaned: {table}")
+        except Exception as e:
+            print(
+                f"ℹ️  Could not clean {table}:"
+                f" {str(e)[:50]}"
+            )        
     print("Applying transformations...")
 
     df_orders = add_silver_metadata(
