@@ -154,7 +154,7 @@ def merge_composite(df, target_path, keys):
     Used when single column is NOT unique.
     order_items: order_id + order_item_id
     payments:    order_id + payment_sequential
-    Builds merge condition dynamically from keys list.
+    Builds merge condition dynamically.
     """
     condition = " AND ".join([
         f"target.{k} = source.{k}"
@@ -192,15 +192,18 @@ def write_history_table(
     3. Join current with incoming on primary key
        Inner join = records that exist in both
        These are potential updates
-    4. Take OLD version from current table
-       These are about to be overwritten by MERGE
-    5. Stamp valid_from, valid_to, change_type
-    6. Append old version to history table
+    4. Count changed records — store in variable
+       Reuse this count later (avoid recompute)
+    5. Take OLD version from current table
+    6. Cache DataFrame before writing
+       Prevents Spark recomputing join twice
+    7. Stamp valid_from, valid_to, change_type
+    8. Write to history table
+    9. Unpersist cache to free memory
 
-    History table captures:
-    - All previous versions of each record
-    - When each version was valid (valid_from/to)
-    - What type of change happened (change_type)
+    FIX: Use changed_count (already computed)
+    instead of history_df.count() after write
+    which caused hang by recomputing join
     """
 
     # First run — no existing Silver table
@@ -221,6 +224,8 @@ def write_history_table(
 
     # Find records that exist in both
     # current and incoming = potential updates
+    # Store count — reuse below to avoid
+    # recomputing the join a second time
     changed_count = current_df.alias("current") \
         .join(
             incoming_df.select(merge_key)
@@ -237,7 +242,7 @@ def write_history_table(
         return
 
     # Take OLD version from current table
-    # Stamp history metadata columns
+    # These are about to be overwritten by MERGE
     history_df = current_df.alias("current") \
         .join(
             incoming_df.select(merge_key)
@@ -265,21 +270,31 @@ def write_history_table(
             current_timestamp()
         )
 
+    # Cache before writing
+    # Prevents Spark recomputing join
+    # when we reference history_df again
+    history_df.cache()
+
     # Append old version to history table
     history_df.write \
         .format("delta") \
         .mode("append") \
         .save(history_path)
 
+    # Use changed_count NOT history_df.count()
+    # history_df.count() after write would
+    # recompute entire join — causes hang
     print(
-        f"✅ {history_df.count():,} records"
+        f"✅ {changed_count:,} records"
         f" written to history"
     )
+
+    # Release cache to free cluster memory
+    history_df.unpersist()
 
 
 # ============================================
 # TABLE TRANSFORMATIONS
-# One function per table
 # ============================================
 
 def transform_orders(df):
@@ -611,7 +626,7 @@ def run_silver_pipeline(spark):
     2. Clean composite key tables before MERGE
     3. Apply transformations per table
     4. Write history BEFORE MERGE
-       for orders and customers only
+       for orders and customers
     5. MERGE into Silver tables
     6. Optimize all Delta tables
     7. Print summary
@@ -659,7 +674,6 @@ def run_silver_pipeline(spark):
 
     # ── Clean composite key tables ────────────
     # order_items and payments use composite keys
-    # Previous runs may have created duplicates
     # Delete and recreate fresh each run
     # Safe to delete — Bronze has raw data
     print("Cleaning composite key tables...")
@@ -675,7 +689,9 @@ def run_silver_pipeline(spark):
             )
             print(f"✅ Cleaned: {table}")
         except Exception as e:
-            print(f"ℹ️  {table} not found — skipping")
+            print(
+                f"ℹ️  {table} not found — skipping"
+            )
 
     print()
 
@@ -706,8 +722,8 @@ def run_silver_pipeline(spark):
     print(f"✅ All transformations applied\n")
 
     # ── Write history BEFORE MERGE ────────────
-    # Orders and customers only
-    # These change most frequently
+    # Orders and customers
+    # Uses cache() to prevent recomputation
     print("Writing history tables...")
 
     write_history_table(
