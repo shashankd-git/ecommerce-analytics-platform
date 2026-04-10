@@ -5,6 +5,9 @@
 #              cleans and standardizes data,
 #              writes Silver Delta tables
 #              using MERGE (upsert pattern)
+#              History tables for orders
+#              and customers track all
+#              previous versions of records
 # ============================================
 
 # ============================================
@@ -14,9 +17,21 @@
 STORAGE_ACCOUNT   = "ecommerceadls2026"
 BRONZE_CONTAINER  = "bronze"
 SILVER_CONTAINER  = "silver"
-CLIENT_ID         = "YOUR_CLIENT_ID"
-CLIENT_SECRET     = "YOUR_CLIENT_SECRET"
-TENANT_ID         = "YOUR_TENANT_ID"
+
+# Credentials from Databricks Secret Scope
+# Never stored in code or GitHub
+CLIENT_ID     = dbutils.secrets.get(
+    scope="ecommerce-scope",
+    key="azure-client-id"
+)
+CLIENT_SECRET = dbutils.secrets.get(
+    scope="ecommerce-scope",
+    key="azure-client-secret"
+)
+TENANT_ID     = dbutils.secrets.get(
+    scope="ecommerce-scope",
+    key="azure-tenant-id"
+)
 
 BRONZE_DELTA_PATH = (
     f"abfss://{BRONZE_CONTAINER}"
@@ -90,7 +105,11 @@ def configure_auth(spark):
 # ============================================
 
 def add_silver_metadata(df):
-    """Add Silver layer audit columns"""
+    """
+    Adds 2 audit columns to every Silver row:
+    - silver_updated_at: when Silver processed it
+    - silver_pipeline_run_id: which Silver run
+    """
     pipeline_run_id = str(uuid.uuid4())
     return df \
         .withColumn(
@@ -101,6 +120,7 @@ def add_silver_metadata(df):
             "silver_pipeline_run_id",
             lit(pipeline_run_id)
         )
+
 
 def merge_to_silver(df, target_path, merge_key):
     """
@@ -125,12 +145,13 @@ def merge_to_silver(df, target_path, merge_key):
           .mode("overwrite").save(target_path)
         print(f"✅ Initial write complete")
 
+
 def merge_composite(df, target_path, keys):
     """
-    MERGE using composite key
-    (multiple columns as primary key).
-    Used for order_items and payments
-    where order_id alone is not unique.
+    MERGE using composite key.
+    Used when single column is NOT unique.
+    order_items: order_id + order_item_id
+    payments:    order_id + payment_sequential
     """
     condition = " AND ".join([
         f"target.{k} = source.{k}"
@@ -149,14 +170,111 @@ def merge_composite(df, target_path, keys):
           .mode("overwrite").save(target_path)
         print(f"✅ Initial write complete")
 
+
+def write_history_table(
+    spark,
+    incoming_df,
+    current_path,
+    history_path,
+    merge_key
+):
+    """
+    Captures changed records BEFORE MERGE
+    and writes them to history table.
+
+    Logic:
+    1. Check if Silver table exists
+       First run = nothing to compare → skip
+    2. Read current Silver table
+    3. Join current with incoming on primary key
+    4. Take OLD version from current table
+    5. Stamp valid_from, valid_to, change_type
+    6. Append old version to history table
+
+    History table captures:
+    - All previous versions of each record
+    - When each version was valid
+    - What type of change happened
+    """
+
+    # First run — no existing Silver table
+    if not DeltaTable.isDeltaTable(
+        spark, current_path
+    ):
+        print(
+            f"ℹ️  No existing table — "
+            f"skipping history"
+        )
+        return
+
+    # Read current Silver table
+    current_df = spark.read \
+        .format("delta") \
+        .load(current_path)
+
+    # Find records that exist in both
+    # current and incoming = potential updates
+    changed_count = current_df.alias("current") \
+        .join(
+            incoming_df.select(merge_key)
+            .alias("incoming"),
+            on=merge_key,
+            how="inner"
+        ).count()
+
+    if changed_count == 0:
+        print(
+            f"ℹ️  No changed records — "
+            f"skipping history"
+        )
+        return
+
+    # Take OLD version from current table
+    # These are about to be overwritten by MERGE
+    history_df = current_df.alias("current") \
+        .join(
+            incoming_df.select(merge_key)
+            .alias("incoming"),
+            on=merge_key,
+            how="inner"
+        ) \
+        .select("current.*") \
+        .withColumn(
+            "valid_from",
+            col("silver_updated_at")
+        ) \
+        .withColumn(
+            "valid_to",
+            current_timestamp()
+        ) \
+        .withColumn(
+            "change_type",
+            lit("update")
+        ) \
+        .withColumn(
+            "history_created_at",
+            current_timestamp()
+        )
+
+    # Append old version to history table
+    history_df.write \
+        .format("delta") \
+        .mode("append") \
+        .save(history_path)
+
+    print(
+        f"✅ {history_df.count():,} records"
+        f" written to history"
+    )
+
+
 # ============================================
 # TABLE TRANSFORMATIONS
 # ============================================
 
 def transform_orders(df):
     """
-    Clean olist_orders:
-    - Parse timestamps String → Timestamp
+    - Parse 5 timestamp columns String→Timestamp
     - Standardize order_status to lowercase
     - Calculate approval_time_minutes
     - Calculate delivery_days
@@ -171,21 +289,26 @@ def transform_orders(df):
             to_timestamp("order_approved_at",
                          "yyyy-MM-dd HH:mm:ss")) \
         .withColumn("order_delivered_carrier_date",
-            to_timestamp("order_delivered_carrier_date",
-                         "yyyy-MM-dd HH:mm:ss")) \
+            to_timestamp(
+                "order_delivered_carrier_date",
+                "yyyy-MM-dd HH:mm:ss")) \
         .withColumn("order_delivered_customer_date",
-            to_timestamp("order_delivered_customer_date",
-                         "yyyy-MM-dd HH:mm:ss")) \
+            to_timestamp(
+                "order_delivered_customer_date",
+                "yyyy-MM-dd HH:mm:ss")) \
         .withColumn("order_estimated_delivery_date",
-            to_timestamp("order_estimated_delivery_date",
-                         "yyyy-MM-dd HH:mm:ss")) \
+            to_timestamp(
+                "order_estimated_delivery_date",
+                "yyyy-MM-dd HH:mm:ss")) \
         .withColumn("order_status",
             trim(lower(col("order_status")))) \
         .withColumn("approval_time_minutes",
-            when(col("order_approved_at").isNotNull(),
+            when(
+                col("order_approved_at").isNotNull(),
                 round(
                     (unix_timestamp("order_approved_at") -
-                     unix_timestamp("order_purchase_timestamp"))
+                     unix_timestamp(
+                         "order_purchase_timestamp"))
                     / 60, 2
                 )
             ).otherwise(None)) \
@@ -208,7 +331,8 @@ def transform_orders(df):
                 col("order_estimated_delivery_date")
             ).otherwise(None)) \
         .select(
-            "order_id", "customer_id", "order_status",
+            "order_id", "customer_id",
+            "order_status",
             "order_purchase_timestamp",
             "order_approved_at",
             "order_delivered_carrier_date",
@@ -222,20 +346,19 @@ def transform_orders(df):
 
 def transform_order_items(df):
     """
-    Clean olist_order_items:
     - Validate price > 0
     - Validate freight_value >= 0
     - Calculate total_item_value
     - Parse shipping_limit_date
-    NOTE: Uses composite key order_id + order_item_id
-          because one order has multiple items
+    NOTE: Composite key order_id + order_item_id
     """
     return df \
         .filter(col("price") > 0) \
         .filter(col("freight_value") >= 0) \
         .withColumn("total_item_value",
             round(
-                col("price") + col("freight_value"), 2
+                col("price") +
+                col("freight_value"), 2
             )) \
         .withColumn("shipping_limit_date",
             to_timestamp("shipping_limit_date",
@@ -251,7 +374,6 @@ def transform_order_items(df):
 
 def transform_customers(df):
     """
-    Clean olist_customers:
     - Standardize city to lowercase
     - Standardize state to uppercase
     - Trim whitespace
@@ -274,11 +396,9 @@ def transform_customers(df):
 
 def transform_products(df, category_df):
     """
-    Clean olist_products:
     - Join English category names
     - Fill null categories with 'unknown'
-    - Fix column name typos (lenght → length)
-    - Validate dimensions
+    - Fix typos: lenght → length
     """
     return df \
         .join(
@@ -324,7 +444,7 @@ def transform_products(df, category_df):
 
 def transform_sellers(df):
     """
-    Clean olist_sellers:
+    SAME PATTERN AS transform_customers
     - Standardize city to lowercase
     - Standardize state to uppercase
     """
@@ -336,20 +456,18 @@ def transform_sellers(df):
             trim(upper(col("seller_state")))) \
         .filter(col("seller_id").isNotNull()) \
         .select(
-            "seller_id", "seller_zip_code_prefix",
+            "seller_id",
+            "seller_zip_code_prefix",
             "seller_city", "seller_state"
         )
 
 
 def transform_payments(df):
     """
-    Clean olist_order_payments:
-    - Remove zero/negative payment values
+    - Remove zero/negative payments
     - Standardize payment_type to lowercase
     - Round payment_value to 2 decimal places
-    NOTE: Uses composite key order_id +
-          payment_sequential because one order
-          can have multiple payment methods
+    NOTE: Composite key order_id + payment_sequential
     """
     return df \
         .filter(col("payment_value") > 0) \
@@ -367,15 +485,11 @@ def transform_payments(df):
 
 def transform_reviews(df):
     """
-    Clean olist_order_reviews:
     - Deduplicate by review_id
     - Validate review_score between 1-5
-    - Parse timestamps safely
-      (check starts with "20" to avoid
-       parsing review text as timestamp)
+    - Parse timestamps safely using
+      .startswith("20") guard
     - Add has_comment flag
-    NOTE: review_comment_message kept as-is
-          Sentiment analysis done in Gold layer
     """
     return df \
         .dropDuplicates(["review_id"]) \
@@ -407,7 +521,8 @@ def transform_reviews(df):
             ).otherwise(None)
         ) \
         .withColumn("has_comment",
-            col("review_comment_message").isNotNull()) \
+            col("review_comment_message").isNotNull()
+        ) \
         .select(
             "review_id", "order_id",
             "review_score",
@@ -421,14 +536,10 @@ def transform_reviews(df):
 
 def transform_geolocation(df):
     """
-    Clean olist_geolocation:
     - Filter invalid Brazilian coordinates
-      (lat: -34 to 6, lng: -74 to -32)
-    - Standardize city to lowercase
-    - Standardize state to uppercase
+    - Standardize city/state
     - Deduplicate by zip code
-      (keep one coordinate per zip code)
-    NOTE: Full refresh pattern — static lookup
+    NOTE: Full refresh pattern
     """
     return df \
         .filter(
@@ -455,9 +566,9 @@ def transform_geolocation(df):
 
 def transform_category_translation(df):
     """
-    Clean category_translation:
     - Remove nulls
     - Standardize to lowercase
+    - Deduplicate
     NOTE: Full refresh — only 71 rows, static
     """
     return df \
@@ -488,10 +599,11 @@ def run_silver_pipeline(spark):
     Main Silver pipeline:
     1. Read all 9 Bronze Delta tables
     2. Apply transformations per table
-    3. Write Silver Delta tables using
-       MERGE, composite MERGE or full refresh
-    4. Optimize all Delta tables
-    5. Print summary report
+    3. Write history BEFORE MERGE
+       for orders and customers only
+    4. MERGE into Silver tables
+    5. Optimize all Delta tables
+    6. Print summary
     """
 
     pipeline_run_id = str(uuid.uuid4())
@@ -504,13 +616,14 @@ def run_silver_pipeline(spark):
     print(f"Started: {start_time}")
     print(f"{'='*60}\n")
 
-    # ── Read Bronze tables ────────────────────
+    # Read Bronze tables
     print("Reading Bronze Delta tables...")
 
     bronze_orders = spark.read.format("delta") \
         .load(BRONZE_DELTA_PATH + "bronze_orders")
     bronze_items = spark.read.format("delta") \
-        .load(BRONZE_DELTA_PATH + "bronze_order_items")
+        .load(BRONZE_DELTA_PATH +
+              "bronze_order_items")
     bronze_customers = spark.read.format("delta") \
         .load(BRONZE_DELTA_PATH + "bronze_customers")
     bronze_products = spark.read.format("delta") \
@@ -518,44 +631,74 @@ def run_silver_pipeline(spark):
     bronze_sellers = spark.read.format("delta") \
         .load(BRONZE_DELTA_PATH + "bronze_sellers")
     bronze_payments = spark.read.format("delta") \
-        .load(BRONZE_DELTA_PATH + "bronze_order_payments")
+        .load(BRONZE_DELTA_PATH +
+              "bronze_order_payments")
     bronze_reviews = spark.read.format("delta") \
-        .load(BRONZE_DELTA_PATH + "bronze_order_reviews")
-    bronze_geolocation = spark.read.format("delta") \
-        .load(BRONZE_DELTA_PATH + "bronze_geolocation")
+        .load(BRONZE_DELTA_PATH +
+              "bronze_order_reviews")
+    bronze_geolocation = spark.read \
+        .format("delta") \
+        .load(BRONZE_DELTA_PATH +
+              "bronze_geolocation")
     bronze_categories = spark.read.format("delta") \
         .load(BRONZE_DELTA_PATH +
               "bronze_category_translation")
 
     print(f"✅ All Bronze tables loaded\n")
 
-    # ── Transform all tables ──────────────────
+    # Apply transformations
     print("Applying transformations...")
 
-    df_orders     = add_silver_metadata(
+    df_orders = add_silver_metadata(
         transform_orders(bronze_orders))
-    df_items      = add_silver_metadata(
+    df_items = add_silver_metadata(
         transform_order_items(bronze_items))
-    df_customers  = add_silver_metadata(
+    df_customers = add_silver_metadata(
         transform_customers(bronze_customers))
-    df_products   = add_silver_metadata(
+    df_products = add_silver_metadata(
         transform_products(
             bronze_products, bronze_categories))
-    df_sellers    = add_silver_metadata(
+    df_sellers = add_silver_metadata(
         transform_sellers(bronze_sellers))
-    df_payments   = add_silver_metadata(
+    df_payments = add_silver_metadata(
         transform_payments(bronze_payments))
-    df_reviews    = add_silver_metadata(
+    df_reviews = add_silver_metadata(
         transform_reviews(bronze_reviews))
     df_geolocation = add_silver_metadata(
         transform_geolocation(bronze_geolocation))
-    df_categories  = add_silver_metadata(
+    df_categories = add_silver_metadata(
         transform_category_translation(
             bronze_categories))
 
     print(f"✅ All transformations applied\n")
 
-    # ── Silver table write config ─────────────
+    # Write history BEFORE MERGE
+    # Orders and customers only
+    print("Writing history tables...")
+
+    write_history_table(
+        spark,
+        incoming_df  = df_orders,
+        current_path = SILVER_DELTA_PATH +
+                       "silver_orders",
+        history_path = SILVER_DELTA_PATH +
+                       "silver_orders_history",
+        merge_key    = "order_id"
+    )
+
+    write_history_table(
+        spark,
+        incoming_df  = df_customers,
+        current_path = SILVER_DELTA_PATH +
+                       "silver_customers",
+        history_path = SILVER_DELTA_PATH +
+                       "silver_customers_history",
+        merge_key    = "customer_id"
+    )
+
+    print(f"✅ History tables written\n")
+
+    # Silver table write config
     silver_tables = [
         {
             "name": "silver_orders",
@@ -590,7 +733,10 @@ def run_silver_pipeline(spark):
         {
             "name": "silver_payments",
             "df": df_payments,
-            "keys": ["order_id", "payment_sequential"],
+            "keys": [
+                "order_id",
+                "payment_sequential"
+            ],
             "type": "merge_composite"
         },
         {
@@ -602,7 +748,9 @@ def run_silver_pipeline(spark):
         {
             "name": "silver_geolocation",
             "df": df_geolocation,
-            "keys": ["geolocation_zip_code_prefix"],
+            "keys": [
+                "geolocation_zip_code_prefix"
+            ],
             "type": "full_refresh"
         },
         {
@@ -613,7 +761,7 @@ def run_silver_pipeline(spark):
         }
     ]
 
-    # ── Write Silver tables ───────────────────
+    # Write all Silver tables
     for config in silver_tables:
         name   = config["name"]
         df     = config["df"]
@@ -652,8 +800,8 @@ def run_silver_pipeline(spark):
 
         except Exception as e:
             print(
-                f"❌ FAILED {name}: "
-                f"{str(e)[:150]}"
+                f"❌ FAILED {name}:"
+                f" {str(e)[:150]}"
             )
             results.append({
                 "table": name,
@@ -661,7 +809,7 @@ def run_silver_pipeline(spark):
                 "error": str(e)[:150]
             })
 
-    # ── Summary ───────────────────────────────
+    # Summary
     end_time = datetime.now()
     duration = (end_time - start_time).seconds
 
