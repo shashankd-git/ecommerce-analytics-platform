@@ -185,112 +185,85 @@ def write_history_table(
     Captures changed records BEFORE MERGE
     and writes them to history table.
 
+    Uses SQL temp views instead of PySpark
+    DataFrame joins for better memory efficiency
+    on single node clusters.
+
     Logic:
     1. Check if Silver table exists
        First run = nothing to compare → skip
-    2. Read current Silver table
-    3. Join current with incoming on primary key
-       Inner join = records that exist in both
-       These are potential updates
-    4. Count changed records — store in variable
-       Reuse this count later (avoid recompute)
-    5. Take OLD version from current table
-    6. Cache DataFrame before writing
-       Prevents Spark recomputing join twice
-    7. Stamp valid_from, valid_to, change_type
-    8. Write to history table
-    9. Unpersist cache to free memory
-
-    FIX: Use changed_count (already computed)
-    instead of history_df.count() after write
-    which caused hang by recomputing join
+    2. Register current Silver + incoming
+       as SQL temp views
+    3. Count matched records using SQL
+    4. Write old versions to history using SQL
+    5. Clean up temp views
     """
 
     # First run — no existing Silver table
-    # Nothing to compare — skip history
     if not DeltaTable.isDeltaTable(
         spark, current_path
     ):
         print(
-            f"ℹ️  No existing table — "
-            f"skipping history"
+            "ℹ️  No existing table — "
+            "skipping history"
         )
         return
 
-    # Read current Silver table
-    current_df = spark.read \
-        .format("delta") \
-        .load(current_path)
+    # Register as temp views
+    # More memory efficient than DataFrame joins
+    spark.read.format("delta") \
+        .load(current_path) \
+        .createOrReplaceTempView("current_silver")
 
-    # Find records that exist in both
-    # current and incoming = potential updates
-    # Store count — reuse below to avoid
-    # recomputing the join a second time
-    changed_count = current_df.alias("current") \
-        .join(
-            incoming_df.select(merge_key)
-            .alias("incoming"),
-            on=merge_key,
-            how="inner"
-        ).count()
+    incoming_df.createOrReplaceTempView(
+        "incoming_data"
+    )
+
+    # Count matched records using SQL
+    changed_count = spark.sql(f"""
+        SELECT COUNT(*)
+        FROM current_silver c
+        INNER JOIN incoming_data i
+        ON c.{merge_key} = i.{merge_key}
+    """).collect()[0][0]
 
     if changed_count == 0:
         print(
-            f"ℹ️  No changed records — "
-            f"skipping history"
+            "ℹ️  No changed records — "
+            "skipping history"
         )
+        spark.catalog.dropTempView(
+            "current_silver"
+        )
+        spark.catalog.dropTempView("incoming_data")
         return
 
-    # Take OLD version from current table
-    # These are about to be overwritten by MERGE
-    history_df = current_df.alias("current") \
-        .join(
-            incoming_df.select(merge_key)
-            .alias("incoming"),
-            on=merge_key,
-            how="inner"
-        ) \
-        .select("current.*") \
-        .withColumn(
-            "valid_from",
-            col("silver_updated_at")
-            # When this version became active
-        ) \
-        .withColumn(
-            "valid_to",
-            current_timestamp()
-            # When this version ended = right now
-        ) \
-        .withColumn(
-            "change_type",
-            lit("update")
-        ) \
-        .withColumn(
-            "history_created_at",
-            current_timestamp()
-        )
-
-    # Cache before writing
-    # Prevents Spark recomputing join
-    # when we reference history_df again
-    history_df.cache()
-
-    # Append old version to history table
-    history_df.write \
+    # Write old versions to history using SQL
+    # SQL engine optimizes memory usage better
+    # than PySpark DataFrame API on small clusters
+    spark.sql(f"""
+        SELECT
+            c.*,
+            c.silver_updated_at  AS valid_from,
+            current_timestamp()  AS valid_to,
+            'update'             AS change_type,
+            current_timestamp()  AS history_created_at
+        FROM current_silver c
+        INNER JOIN incoming_data i
+        ON c.{merge_key} = i.{merge_key}
+    """).write \
         .format("delta") \
         .mode("append") \
         .save(history_path)
 
-    # Use changed_count NOT history_df.count()
-    # history_df.count() after write would
-    # recompute entire join — causes hang
     print(
         f"✅ {changed_count:,} records"
         f" written to history"
     )
 
-    # Release cache to free cluster memory
-    history_df.unpersist()
+    # Clean up temp views
+    spark.catalog.dropTempView("current_silver")
+    spark.catalog.dropTempView("incoming_data")
 
 
 # ============================================
@@ -723,7 +696,7 @@ def run_silver_pipeline(spark):
 
     # ── Write history BEFORE MERGE ────────────
     # Orders and customers
-    # Uses cache() to prevent recomputation
+    # Uses SQL temp views for memory efficiency
     print("Writing history tables...")
 
     write_history_table(
