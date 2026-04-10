@@ -18,7 +18,7 @@ STORAGE_ACCOUNT   = "ecommerceadls2026"
 BRONZE_CONTAINER  = "bronze"
 SILVER_CONTAINER  = "silver"
 
-# Credentials from Databricks Secret Scopes
+# Credentials from Databricks Secret Scope
 # Never stored in code or GitHub
 CLIENT_ID     = dbutils.secrets.get(
     scope="ecommerce-scope",
@@ -100,6 +100,7 @@ def configure_auth(spark):
     )
     print("✅ Authentication configured")
 
+
 # ============================================
 # SILVER HELPER FUNCTIONS
 # ============================================
@@ -127,6 +128,7 @@ def merge_to_silver(df, target_path, merge_key):
     MERGE using single primary key.
     INSERT new records.
     UPDATE changed records.
+    If table does not exist yet → create fresh.
     """
     if DeltaTable.isDeltaTable(spark, target_path):
         DeltaTable.forPath(spark, target_path) \
@@ -152,6 +154,7 @@ def merge_composite(df, target_path, keys):
     Used when single column is NOT unique.
     order_items: order_id + order_item_id
     payments:    order_id + payment_sequential
+    Builds merge condition dynamically from keys list.
     """
     condition = " AND ".join([
         f"target.{k} = source.{k}"
@@ -187,17 +190,21 @@ def write_history_table(
        First run = nothing to compare → skip
     2. Read current Silver table
     3. Join current with incoming on primary key
+       Inner join = records that exist in both
+       These are potential updates
     4. Take OLD version from current table
+       These are about to be overwritten by MERGE
     5. Stamp valid_from, valid_to, change_type
     6. Append old version to history table
 
     History table captures:
     - All previous versions of each record
-    - When each version was valid
-    - What type of change happened
+    - When each version was valid (valid_from/to)
+    - What type of change happened (change_type)
     """
 
     # First run — no existing Silver table
+    # Nothing to compare — skip history
     if not DeltaTable.isDeltaTable(
         spark, current_path
     ):
@@ -230,7 +237,7 @@ def write_history_table(
         return
 
     # Take OLD version from current table
-    # These are about to be overwritten by MERGE
+    # Stamp history metadata columns
     history_df = current_df.alias("current") \
         .join(
             incoming_df.select(merge_key)
@@ -242,10 +249,12 @@ def write_history_table(
         .withColumn(
             "valid_from",
             col("silver_updated_at")
+            # When this version became active
         ) \
         .withColumn(
             "valid_to",
             current_timestamp()
+            # When this version ended = right now
         ) \
         .withColumn(
             "change_type",
@@ -270,6 +279,7 @@ def write_history_table(
 
 # ============================================
 # TABLE TRANSFORMATIONS
+# One function per table
 # ============================================
 
 def transform_orders(df):
@@ -598,12 +608,13 @@ def run_silver_pipeline(spark):
     """
     Main Silver pipeline:
     1. Read all 9 Bronze Delta tables
-    2. Apply transformations per table
-    3. Write history BEFORE MERGE
+    2. Clean composite key tables before MERGE
+    3. Apply transformations per table
+    4. Write history BEFORE MERGE
        for orders and customers only
-    4. MERGE into Silver tables
-    5. Optimize all Delta tables
-    6. Print summary
+    5. MERGE into Silver tables
+    6. Optimize all Delta tables
+    7. Print summary
     """
 
     pipeline_run_id = str(uuid.uuid4())
@@ -616,7 +627,7 @@ def run_silver_pipeline(spark):
     print(f"Started: {start_time}")
     print(f"{'='*60}\n")
 
-    # Read Bronze tables
+    # ── Read Bronze tables ────────────────────
     print("Reading Bronze Delta tables...")
 
     bronze_orders = spark.read.format("delta") \
@@ -646,27 +657,29 @@ def run_silver_pipeline(spark):
 
     print(f"✅ All Bronze tables loaded\n")
 
-    # ── Clean up tables with known ────────────
-    # duplicate key issues before MERGE
+    # ── Clean composite key tables ────────────
+    # order_items and payments use composite keys
+    # Previous runs may have created duplicates
+    # Delete and recreate fresh each run
     # Safe to delete — Bronze has raw data
-    # Pipeline will recreate fresh
-    tables_to_clean = [
-            "silver_order_items",
-            "silver_payments"
-    ]
-    for table in tables_to_clean:
-        path = SILVER_DELTA_PATH + table
+    print("Cleaning composite key tables...")
+
+    for table in [
+        "silver_order_items",
+        "silver_payments"
+    ]:
         try:
-            if DeltaTable.isDeltaTable(
-                spark, path
-            ):
-                dbutils.fs.rm(path, recurse = True)
-                print(f"✅ Cleaned: {table}")
+            dbutils.fs.rm(
+                SILVER_DELTA_PATH + table,
+                recurse=True
+            )
+            print(f"✅ Cleaned: {table}")
         except Exception as e:
-            print(
-                f"ℹ️  Could not clean {table}:"
-                f" {str(e)[:50]}"
-            )        
+            print(f"ℹ️  {table} not found — skipping")
+
+    print()
+
+    # ── Apply transformations ─────────────────
     print("Applying transformations...")
 
     df_orders = add_silver_metadata(
@@ -692,8 +705,9 @@ def run_silver_pipeline(spark):
 
     print(f"✅ All transformations applied\n")
 
-    # Write history BEFORE MERGE
+    # ── Write history BEFORE MERGE ────────────
     # Orders and customers only
+    # These change most frequently
     print("Writing history tables...")
 
     write_history_table(
@@ -718,7 +732,7 @@ def run_silver_pipeline(spark):
 
     print(f"✅ History tables written\n")
 
-    # Silver table write config
+    # ── Silver table write config ─────────────
     silver_tables = [
         {
             "name": "silver_orders",
@@ -781,7 +795,7 @@ def run_silver_pipeline(spark):
         }
     ]
 
-    # Write all Silver tables
+    # ── Write all Silver tables ───────────────
     for config in silver_tables:
         name   = config["name"]
         df     = config["df"]
@@ -829,7 +843,7 @@ def run_silver_pipeline(spark):
                 "error": str(e)[:150]
             })
 
-    # Summary
+    # ── Summary ───────────────────────────────
     end_time = datetime.now()
     duration = (end_time - start_time).seconds
 
